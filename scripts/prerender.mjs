@@ -5,6 +5,8 @@
 //   - dist/{route}/index.html with correct <head> metadata for each route
 //   - a static content snapshot inside #root (replaced on React hydration) so
 //     non-JS crawlers see real text, not an empty shell
+//   - dist/404.html — served by Vercel with a real HTTP 404 status for URLs
+//     that match no static file and no SPA rewrite in vercel.json
 //   - dist/sitemap.xml with <lastmod>, derived from the same route list
 //
 // Social media crawlers (Twitter, LinkedIn, Slack) don't execute JS — they need
@@ -16,6 +18,7 @@
 // and FAQ edits are picked up here automatically.
 
 import { readFileSync, mkdirSync, writeFileSync } from 'fs'
+import { execFileSync } from 'child_process'
 import { join, dirname } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import { buildLlmsFull } from './llms-full.mjs'
@@ -43,6 +46,29 @@ const { render } = await import(pathToFileURL(join(rootDir, 'dist-ssr', 'entry-s
 
 function escapeAttr(str) {
   return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+}
+
+// Sitemap <lastmod> for pages without a natural content date: the committer
+// date of the latest commit that touched the given source files. Returns null
+// when git is unavailable or history is too shallow to tell — the entry then
+// simply omits <lastmod> instead of advertising a stale hardcoded date.
+const lastmodCache = new Map()
+function gitLastmod(...patterns) {
+  const key = patterns.join('\n')
+  if (!lastmodCache.has(key)) {
+    let date = null
+    try {
+      const out = execFileSync('git', ['log', '-1', '--format=%cs', '--', ...patterns], {
+        cwd: rootDir,
+        encoding: 'utf8',
+      }).trim()
+      if (/^\d{4}-\d{2}-\d{2}$/.test(out)) date = out
+    } catch {
+      // No git available — leave null.
+    }
+    lastmodCache.set(key, date)
+  }
+  return lastmodCache.get(key)
 }
 
 function blogPostingJsonLd(post) {
@@ -97,7 +123,7 @@ const routes = [
     description:
       'OpenThorn is the BYOK AI website builder — describe what you want, get a complete, deployable website. No subscription, no lock-in.',
     ogType: 'website',
-    lastmod: '2026-06-11',
+    lastmod: gitLastmod('index.html', 'src/App.tsx', 'src/components/HeroSection'),
     jsonLd: [
       {
         '@context': 'https://schema.org',
@@ -123,7 +149,7 @@ const routes = [
     description:
       'Compare per-token pricing across the AI providers OpenThorn supports. You pay your provider directly — OpenThorn charges no subscription.',
     ogType: 'website',
-    lastmod: '2026-06-11',
+    lastmod: gitLastmod('src/pages/PricingPage.tsx'),
     jsonLd: [],
   },
   {
@@ -168,7 +194,7 @@ const routes = [
     description:
       'Answers to common questions about OpenThorn — how bring-your-own-key works, supported AI providers, costs, and deploying your generated site.',
     ogType: 'website',
-    lastmod: '2026-06-11',
+    lastmod: gitLastmod('src/data/faq.json'),
     jsonLd: [
       {
         '@context': 'https://schema.org',
@@ -285,7 +311,7 @@ const routes = [
     description:
       'Plain-English definitions of the terms behind AI website building: BYOK, AI agents, tokens, context windows, API keys, and more.',
     ogType: 'website',
-    lastmod: '2026-06-12',
+    lastmod: gitLastmod('src/data/glossary.json'),
     jsonLd: [
       {
         '@context': 'https://schema.org',
@@ -315,6 +341,7 @@ const routes = [
     title: 'Terms of Service — OpenThorn',
     description: 'Terms of service for OpenThorn.',
     ogType: 'website',
+    lastmod: gitLastmod('src/pages/TermsPage.tsx'),
     jsonLd: [pageBreadcrumbJsonLd('Terms of Service')],
   },
   {
@@ -322,7 +349,7 @@ const routes = [
     title: 'Privacy Policy — OpenThorn',
     description: 'Privacy policy for OpenThorn.',
     ogType: 'website',
-    lastmod: '2026-06-10',
+    lastmod: gitLastmod('src/pages/PrivacyPage.tsx'),
     jsonLd: [pageBreadcrumbJsonLd('Privacy Policy')],
   },
   {
@@ -330,7 +357,7 @@ const routes = [
     title: 'Cookie Policy — OpenThorn',
     description: 'Cookie policy for OpenThorn.',
     ogType: 'website',
-    lastmod: '2026-06-10',
+    lastmod: gitLastmod('src/pages/CookiesPage.tsx'),
     jsonLd: [pageBreadcrumbJsonLd('Cookie Policy')],
   },
   {
@@ -338,6 +365,7 @@ const routes = [
     title: 'Imprint — OpenThorn',
     description: 'Legal imprint for OpenThorn.',
     ogType: 'website',
+    lastmod: gitLastmod('src/pages/ImprintPage.tsx'),
     jsonLd: [pageBreadcrumbJsonLd('Imprint')],
   },
   {
@@ -345,6 +373,7 @@ const routes = [
     title: 'Moderation and DSA — OpenThorn',
     description: 'Moderation policy and DSA compliance information for OpenThorn.',
     ogType: 'website',
+    lastmod: gitLastmod('src/pages/ModerationPage.tsx'),
     jsonLd: [pageBreadcrumbJsonLd('Moderation and DSA')],
   },
 ]
@@ -450,6 +479,28 @@ for (const route of routes) {
 
   writeFileSync(outPath, html, 'utf8')
   console.log(`✓ ${route.path}`)
+}
+
+// ---------------------------------------------------------------------------
+// 404 page — prerenders NotFoundPage so unknown URLs can return a real HTTP
+// 404 status instead of the home page with status 200 (a soft 404). Vercel
+// serves this file automatically whenever nothing else matches; vercel.json's
+// rewrite list covers only genuine SPA routes.
+{
+  const appHtml = await render('/__not_found__')
+  let html = baseHtml
+  html = html.replace(/<title>[^<]*<\/title>/, '<title>Page not found — OpenThorn</title>')
+  html = html.replace(
+    /(<meta name="description" content=")[^"]*(")/,
+    '$1The page you are looking for does not exist or has moved.$2'
+  )
+  // No canonical on purpose — this document must never be indexed.
+  html = html.replace('</head>', '  <meta name="robots" content="noindex" />\n  </head>')
+  if (appHtml) {
+    html = html.replace('<div id="root"></div>', `<div id="root">${appHtml}</div>`)
+  }
+  writeFileSync(join(distDir, '404.html'), html, 'utf8')
+  console.log('✓ /404')
 }
 
 // ---------------------------------------------------------------------------
