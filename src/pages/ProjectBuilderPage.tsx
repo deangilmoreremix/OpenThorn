@@ -1297,6 +1297,29 @@ export default function ProjectBuilderPage() {
     agentAbortRef.current?.abort()
   }, [])
 
+  const handleNewChat = useCallback(() => {
+    if (!user || isViewOnly || agentRunning || reconnecting || remoteGenerating) return
+
+    pendingRequestRef.current = null
+    agentHistoryRef.current = []
+    setMessages([])
+
+    // The throttled save effect skips chats without assistant messages, so the
+    // cleared state must be persisted explicitly — chained after any queued save
+    // so an out-of-order write can't resurrect the old conversation on reload.
+    if (projectId) {
+      chatSaveChainRef.current = chatSaveChainRef.current
+        .then(async () => {
+          const { error } = await supabase
+            .from('projects')
+            .update({ chat_history: [], agent_history: [] })
+            .eq('id', projectId)
+          if (error) throw error
+        })
+        .catch((error) => logError('ProjectClearChat', error))
+    }
+  }, [user, projectId, isViewOnly, agentRunning, reconnecting, remoteGenerating])
+
   const handleAgentRequest = useCallback(async (
     request: string,
     selectedModel: SelectedAgentModel | null,
@@ -2164,6 +2187,18 @@ export default function ProjectBuilderPage() {
 
       <main className={styles.shell}>
         <aside className={styles.chatPanel}>
+          <div className={styles.chatHeader}>
+            <button
+              className={styles.newChatBtn}
+              type="button"
+              aria-label="Start a new conversation"
+              title="New conversation"
+              onClick={handleNewChat}
+              disabled={!user || isViewOnly || !chatHistoryLoaded || messages.length === 0 || agentRunning || reconnecting || remoteGenerating}
+            >
+              <PlusIcon />
+            </button>
+          </div>
           <div className={styles.thread}>
             {messages.map((message) => (
               message.role === 'user' ? (
@@ -2775,6 +2810,10 @@ function DownloadIcon() {
       <path d="M12 11v5M9 14l3 3 3-3" />
     </svg>
   )
+}
+
+function PlusIcon() {
+  return <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
 }
 
 function ShareIcon() {
