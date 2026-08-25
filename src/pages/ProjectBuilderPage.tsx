@@ -460,6 +460,11 @@ export default function ProjectBuilderPage() {
   const lastChatSaveRef = useRef(0)
   const chatSaveChainRef = useRef<Promise<void>>(Promise.resolve())
   const filesSaveChainRef = useRef<Promise<void>>(Promise.resolve())
+  // Snapshot of the chat currently persisted in the database. Realtime echoes
+  // every row UPDATE back to us — including writes to unrelated columns that
+  // carry an older chat_history — so this is compared to detect and drop
+  // self-echoes instead of letting them roll back newer local messages.
+  const lastPersistedChatRef = useRef<unknown[] | null>(null)
 
   const activeCodeFile = projectFiles.find((file) => file.path === activeFile) ?? projectFiles[0] ?? EMPTY_CODE_FILE
   const userInitial = user?.user_metadata?.full_name?.charAt(0).toUpperCase() ?? user?.email?.charAt(0).toUpperCase() ?? 'U'
@@ -563,6 +568,7 @@ export default function ProjectBuilderPage() {
         if (Array.isArray(existing.chat_history) && (existing.chat_history as ChatMessage[]).length > 0) {
           const collaboratorChat = existing.chat_history as ChatMessage[]
           setMessages(sanitizeChatTimelines(collaboratorChat))
+          lastPersistedChatRef.current = existing.chat_history as unknown[]
           if (collaboratorChat.some((m) => m.role === 'assistant')) agentHasRunRef.current = true
         }
         setChatHistoryLoaded(true)
@@ -608,6 +614,7 @@ export default function ProjectBuilderPage() {
             ? savedChat.slice(0, -1)
             : savedChat
           setMessages(cleaned)
+          lastPersistedChatRef.current = savedChat as unknown[]
           resumePromptRef.current = lastUserMsg.content as string
           // Interrupted initial build (no files landed yet) restarts in create
           // mode; once partial files exist the re-run continues as a refine.
@@ -621,9 +628,11 @@ export default function ProjectBuilderPage() {
         } else {
           // Nothing to resume from — at least clear the stuck spinners so nothing spins forever.
           setMessages(sanitizeChatTimelines(savedChat))
+          lastPersistedChatRef.current = savedChat as unknown[]
         }
       } else if (savedChat) {
         setMessages(sanitizeChatTimelines(savedChat))
+        lastPersistedChatRef.current = savedChat as unknown[]
       }
       // Restore LLM conversation history so the agent retains full context across page loads.
       // Don't restore if interrupted — the interrupted run will re-run and rebuild its own history.
@@ -675,7 +684,9 @@ export default function ProjectBuilderPage() {
           timeline: [],
           error: true,
         }])
-        setChatHistoryLoaded(true)
+        // Deliberately leave `chatHistoryLoaded` false on failure: enabling it
+        // here would let this placeholder message overwrite the real chat
+        // history in the database, permanently wiping the conversation.
         setFilesLoaded(true)
       }
     }
@@ -767,7 +778,17 @@ export default function ProjectBuilderPage() {
       }
     },
     onChatUpdate: (chat) => {
-      if (!agentRunning && !isResumingRef.current) setMessages(chat as ChatMessage[])
+      if (agentRunning || isResumingRef.current) return
+      // Drop echoes of our own writes: an UPDATE to any column (title, files,
+      // generating flag) broadcasts the full row, whose chat_history may be
+      // older than our local state. Applying it would roll messages back —
+      // and the throttled save would then persist that rollback.
+      if (
+        lastPersistedChatRef.current &&
+        JSON.stringify(chat) === JSON.stringify(lastPersistedChatRef.current)
+      ) return
+      lastPersistedChatRef.current = chat
+      setMessages(chat as ChatMessage[])
     },
     onGeneratingChange: (generating, generatingBy) => {
       // Ignore own agent's generating state — only track remote collaborators
@@ -943,6 +964,7 @@ export default function ProjectBuilderPage() {
             .update({ chat_history: messages as unknown as Record<string, unknown>[] })
             .eq('id', projectId)
           if (error) throw error
+          lastPersistedChatRef.current = messages
         })
         .catch((error) => logError('ProjectSaveChat', error))
     }, wait)
@@ -1315,6 +1337,7 @@ export default function ProjectBuilderPage() {
             .update({ chat_history: [], agent_history: [] })
             .eq('id', projectId)
           if (error) throw error
+          lastPersistedChatRef.current = []
         })
         .catch((error) => logError('ProjectClearChat', error))
     }
@@ -1576,11 +1599,18 @@ export default function ProjectBuilderPage() {
       if (result.filesMutated) setFirstRunComplete(true)
       agentHistoryRef.current = result.conversationHistory
       if (projectId && !isViewOnly) {
-        supabase.from('projects')
-          .update({ agent_history: result.conversationHistory as unknown as Record<string, unknown>[] })
-          .eq('id', projectId)
-          .then(({ error }) => { if (error) logError('ProjectSaveAgentHistory', error) },
-               (error: unknown) => logError('ProjectSaveAgentHistory', error))
+        // Chained behind pending chat writes so an out-of-order completion can't
+        // overwrite the empty state written by "New Chat".
+        const historyToSave = result.conversationHistory
+        chatSaveChainRef.current = chatSaveChainRef.current
+          .then(async () => {
+            const { error } = await supabase
+              .from('projects')
+              .update({ agent_history: historyToSave as unknown as Record<string, unknown>[] })
+              .eq('id', projectId)
+            if (error) throw error
+          })
+          .catch((error) => logError('ProjectSaveAgentHistory', error))
       }
       setAgentStatus('')
 
